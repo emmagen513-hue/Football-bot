@@ -1,0 +1,1889 @@
+"""Football Telegram bot: Dixon-Coles model + bookmaker blend + accumulator builder. ONE file.
+
+Before running: paste your NEW Telegram token and Gemini key below (keep this file private).
+"""
+import os
+import logging
+
+# ---------- PUT YOUR NEW KEYS HERE (between the quotes) ----------
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "PASTE-YOUR-NEW-TELEGRAM-TOKEN-HERE")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "PASTE-YOUR-NEW-GEMINI-KEY-HERE")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+# -----------------------------------------------------------------
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from google import genai
+from google.genai import types
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+for _noisy in ("httpx", "httpcore"):   # these log request URLs, which contain the bot token
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+client = None
+
+import io
+import urllib.request
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.special import gammaln
+
+MAX_GOALS = 10
+XI = 0.0018   # time decay per day (about a 1-year half-life)
+REG = 0.5     # small penalty that stops extreme ratings for teams with few games
+BASE = "https://www.football-data.co.uk"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+# ---------------- DATA ----------------
+def season_codes(n=2):
+    """['2627', '2526'] style codes, current season first."""
+    now = datetime.now()
+    year = now.year if now.month >= 7 else now.year - 1
+    return [f"{str(y)[2:]}{str(y + 1)[2:]}" for y in range(year, year - n, -1)]
+
+
+def fetch_text(url, tries=3):
+    """Download a text file, retrying briefly on temporary server errors (503 and friends)."""
+    import time as _time
+    import urllib.error as _err
+    last = None
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except _err.HTTPError as e:
+            last = e
+            if e.code not in (429, 500, 502, 503, 504):
+                raise
+        except (_err.URLError, TimeoutError, OSError) as e:
+            last = e
+        if i < tries - 1:
+            _time.sleep(2 * (i + 1))
+    raise last
+
+
+def load_results(div="E0", n_seasons=2):
+    """Download results for a league (E0=EPL, E1=Championship, SP1, I1, D1)."""
+    frames = []
+    for code in season_codes(n_seasons):
+        url = f"{BASE}/mmz4281/{code}/{div}.csv"
+        try:
+            raw = fetch_text(url)
+            df = pd.read_csv(io.StringIO(raw))
+            df.columns = [c.strip() for c in df.columns]
+            frames.append(df)
+            print(f"Loaded {div} {code}: {len(df)} rows")
+        except Exception as e:
+            print(f"Could not load {div} {code}: {e}")
+    if not frames:
+        raise RuntimeError("No data could be downloaded.")
+    df = pd.concat(frames, ignore_index=True)
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df = df.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
+    df["FTHG"] = df["FTHG"].astype(int)
+    df["FTAG"] = df["FTAG"].astype(int)
+    return df
+
+
+# ---------------- MODEL ----------------
+def _tau(x, y, lh, la, rho):
+    """Dixon-Coles low-score correction, vectorised."""
+    t = np.ones_like(lh)
+    m = (x == 0) & (y == 0); t[m] = 1 - lh[m] * la[m] * rho
+    m = (x == 0) & (y == 1); t[m] = 1 + lh[m] * rho
+    m = (x == 1) & (y == 0); t[m] = 1 + la[m] * rho
+    m = (x == 1) & (y == 1); t[m] = 1 - rho
+    return np.maximum(t, 1e-6)
+
+
+class DixonColes:
+    def fit(self, df, xi=XI, reg=REG):
+        teams = sorted(set(df["HomeTeam"]) | set(df["AwayTeam"]))
+        idx = {t: i for i, t in enumerate(teams)}
+        n = len(teams)
+        h = df["HomeTeam"].map(idx).to_numpy()
+        a = df["AwayTeam"].map(idx).to_numpy()
+        x = df["FTHG"].to_numpy()
+        y = df["FTAG"].to_numpy()
+
+        days = (df["Date"].max() - df["Date"]).dt.days.to_numpy()
+        w = np.exp(-xi * days)  # recent matches weigh more
+
+        def unpack(p):
+            att = p[:n] - p[:n].mean()
+            dfn = p[n:2 * n] - p[n:2 * n].mean()
+            return att, dfn, p[2 * n], p[2 * n + 1], p[2 * n + 2]
+
+        def nll_grad(p):
+            """Negative log-likelihood and its exact gradient (makes the fit far faster)."""
+            att, dfn, home, mu, rho = unpack(p)
+            lh = np.exp(mu + home + att[h] - dfn[a])
+            la = np.exp(mu + att[a] - dfn[h])
+            tau = _tau(x, y, lh, la, rho)
+            ll = w * (
+                np.log(tau)
+                + x * np.log(lh) - lh - gammaln(x + 1)
+                + y * np.log(la) - la - gammaln(y + 1)
+            )
+            f = -ll.sum() + reg * (np.sum(att ** 2) + np.sum(dfn ** 2))
+
+            gH = w * (x - lh)          # d(log-lik)/d(log home rate)
+            gA = w * (y - la)          # d(log-lik)/d(log away rate)
+            gR = np.zeros_like(lh)     # d(log-lik)/d(rho)
+            m = (x == 0) & (y == 0)
+            c = -w[m] * lh[m] * la[m] * rho / tau[m]
+            gH[m] += c; gA[m] += c; gR[m] = -w[m] * lh[m] * la[m] / tau[m]
+            m = (x == 0) & (y == 1)
+            gH[m] += w[m] * lh[m] * rho / tau[m]; gR[m] = w[m] * lh[m] / tau[m]
+            m = (x == 1) & (y == 0)
+            gA[m] += w[m] * la[m] * rho / tau[m]; gR[m] = w[m] * la[m] / tau[m]
+            m = (x == 1) & (y == 1)
+            gR[m] = -w[m] / tau[m]
+
+            g_att = -(np.bincount(h, gH, n) + np.bincount(a, gA, n)) + 2 * reg * att
+            g_def = (np.bincount(a, gH, n) + np.bincount(h, gA, n)) + 2 * reg * dfn
+            g = np.zeros(2 * n + 3)
+            g[:n] = g_att - g_att.mean()          # centring the ratings removes the mean
+            g[n:2 * n] = g_def - g_def.mean()
+            g[2 * n] = -gH.sum()
+            g[2 * n + 1] = -(gH.sum() + gA.sum())
+            g[2 * n + 2] = -gR.sum()
+            return f, g
+
+        p0 = np.zeros(2 * n + 3)
+        p0[2 * n] = 0.25      # home advantage
+        p0[2 * n + 1] = 0.2   # baseline log goals
+        bounds = [(None, None)] * (2 * n + 2) + [(-0.2, 0.2)]
+        res = minimize(nll_grad, p0, jac=True, method="L-BFGS-B", bounds=bounds)
+        if not res.success:
+            print("Warning: optimiser did not fully converge:", res.message)
+
+        self.teams = teams
+        self.att, self.dfn, self.home, self.mu, self.rho = unpack(res.x)
+        self.idx = idx
+        self.n_matches = len(df)
+        return self
+
+    def resolve(self, name):
+        """Exact match, then substring either way, then a close spelling match."""
+        import difflib
+        q = name.strip().lower()
+        for t in self.teams:
+            if t.lower() == q:
+                return t
+        for t in self.teams:
+            if q and q in t.lower():
+                return t
+        inside = [t for t in self.teams if len(t) >= 4 and t.lower() in q]   # "CE Sabadell FC" -> Sabadell
+        if inside:
+            return max(inside, key=len)
+        close = difflib.get_close_matches(q, [t.lower() for t in self.teams], n=1, cutoff=0.75)
+        if close:
+            return next(t for t in self.teams if t.lower() == close[0])
+        raise ValueError(f"Team not found: {name}")
+
+    def _lambdas(self, home, away):
+        i, j = self.idx[home], self.idx[away]
+        lh = float(np.exp(self.mu + self.home + self.att[i] - self.dfn[j]))
+        la = float(np.exp(self.mu + self.att[j] - self.dfn[i]))
+        return lh, la
+
+    def score_matrix(self, home, away):
+        lh, la = self._lambdas(home, away)
+        k = np.arange(MAX_GOALS + 1)
+        ph = np.exp(-lh + k * np.log(lh) - gammaln(k + 1))
+        pa = np.exp(-la + k * np.log(la) - gammaln(k + 1))
+        m = np.outer(ph, pa)
+        m[0, 0] *= max(1e-6, 1 - lh * la * self.rho)
+        m[0, 1] *= 1 + lh * self.rho
+        m[1, 0] *= 1 + la * self.rho
+        m[1, 1] *= 1 - self.rho
+        return m / m.sum(), lh, la
+
+    def markets(self, home_name, away_name):
+        home, away = self.resolve(home_name), self.resolve(away_name)
+        if home == away:
+            raise ValueError("Home and away team are the same.")
+        m, lh, la = self.score_matrix(home, away)
+        i, j = np.indices(m.shape)
+        p = {
+            "home_win": m[i > j].sum(),
+            "draw": m[i == j].sum(),
+            "away_win": m[i < j].sum(),
+            "over_1_5": m[i + j > 1].sum(),
+            "over_2_5": m[i + j > 2].sum(),
+            "btts": m[(i > 0) & (j > 0)].sum(),
+        }
+        p["1X"] = p["home_win"] + p["draw"]
+        p["X2"] = p["draw"] + p["away_win"]
+        p["12"] = p["home_win"] + p["away_win"]
+        out = {k: round(float(v), 4) for k, v in p.items()}
+        out.update({
+            "fixture": f"{home} vs {away}",
+            "home_xg": round(lh, 2),
+            "away_xg": round(la, 2),
+        })
+        return out
+
+
+
+# ---------------- ODDS BACKTEST ----------------
+# (home, draw, away) odds columns, best source first: average closing odds,
+# then Pinnacle closing, then Bet365 closing, then the same with opening odds.
+TRIPLES = [
+    ("AvgCH", "AvgCD", "AvgCA"),
+    ("PSCH", "PSCD", "PSCA"),
+    ("B365CH", "B365CD", "B365CA"),
+    ("AvgH", "AvgD", "AvgA"),
+    ("PSH", "PSD", "PSA"),
+    ("B365H", "B365D", "B365A"),
+]
+# (over 2.5, under 2.5) odds columns
+PAIRS = [
+    ("AvgC>2.5", "AvgC<2.5"),
+    ("PC>2.5", "PC<2.5"),
+    ("B365C>2.5", "B365C<2.5"),
+    ("Avg>2.5", "Avg<2.5"),
+    ("P>2.5", "P<2.5"),
+    ("B365>2.5", "B365<2.5"),
+]
+
+
+def pick_columns(df, options, min_share=0.8):
+    tail = df.tail(200)
+    for cols in options:
+        if all(c in df.columns for c in cols) and all(tail[c].notna().mean() >= min_share for c in cols):
+            return list(cols)
+    return None
+
+
+def remove_margin(odds):
+    """Turn bookmaker odds into probabilities that sum to 1."""
+    inv = 1.0 / np.asarray(odds, dtype=float)
+    return inv / inv.sum()
+
+
+def backtest(df, n_test=150, refit_every=10, min_train=200):
+    tri = pick_columns(df, TRIPLES)
+    pair = pick_columns(df, PAIRS)
+    if tri is None:
+        raise RuntimeError("No usable 1X2 odds columns found in the data.")
+    print("1X2 odds columns:", tri)
+    print("Over/Under odds columns:", pair)
+
+    start = max(min_train, len(df) - n_test)
+    bets, ll_model, ll_market = [], [], []
+
+    for block_start in range(start, len(df), refit_every):
+        model = DixonColes().fit(df.iloc[:block_start])
+        block = df.iloc[block_start:block_start + refit_every]
+        print(f"Tested up to match {min(block_start + refit_every, len(df))} of {len(df)}")
+
+        for _, r in block.iterrows():
+            if r["HomeTeam"] not in model.idx or r["AwayTeam"] not in model.idx:
+                continue  # team with no history (e.g. just promoted)
+            res = model.markets(r["HomeTeam"], r["AwayTeam"])
+            hg, ag = r["FTHG"], r["FTAG"]
+
+            # ---- 1X2 ----
+            odds = [r[c] for c in tri]
+            if not any(pd.isna(odds)) and min(odds) > 1:
+                p_model = [res["home_win"], res["draw"], res["away_win"]]
+                p_market = remove_margin(odds)
+                actual = 0 if hg > ag else (1 if hg == ag else 2)
+                ll_model.append(-np.log(max(p_model[actual], 1e-9)))
+                ll_market.append(-np.log(max(p_market[actual], 1e-9)))
+                for k, name in enumerate(["home", "draw", "away"]):
+                    bets.append({
+                        "market": "1X2", "sel": name,
+                        "p_model": p_model[k], "p_market": p_market[k], "odds": odds[k],
+                        "edge": p_model[k] * odds[k] - 1, "won": actual == k,
+                    })
+
+            # ---- Over/Under 2.5 ----
+            if pair:
+                odds = [r[c] for c in pair]
+                if not any(pd.isna(odds)) and min(odds) > 1:
+                    p_model = [res["over_2_5"], 1 - res["over_2_5"]]
+                    p_market = remove_margin(odds)
+                    over = (hg + ag) > 2
+                    for k, name in enumerate(["over 2.5", "under 2.5"]):
+                        bets.append({
+                            "market": "O/U 2.5", "sel": name,
+                            "p_model": p_model[k], "p_market": p_market[k], "odds": odds[k],
+                            "edge": p_model[k] * odds[k] - 1,
+                            "won": over if k == 0 else not over,
+                        })
+    return bets, ll_model, ll_market
+
+
+def summarize(bets, thresholds=(0.0, 0.03, 0.05, 0.10)):
+    print("\nFlat 1-unit stakes, by minimum edge (edge = model prob x odds - 1)")
+    for market in ["1X2", "O/U 2.5", "ALL"]:
+        pool = [b for b in bets if market == "ALL" or b["market"] == market]
+        print(f"\n{market}")
+        print(f"{'min edge':>9} {'bets':>5} {'wins':>5} {'profit':>8} {'ROI':>7}")
+        for t in thresholds:
+            sel = [b for b in pool if b["edge"] >= t]
+            if not sel:
+                print(f"{t:>9.0%} {0:>5} {0:>5} {0:>8.2f} {'-':>7}")
+                continue
+            profit = sum((b["odds"] - 1) if b["won"] else -1 for b in sel)
+            wins = sum(b["won"] for b in sel)
+            print(f"{t:>9.0%} {len(sel):>5} {wins:>5} {profit:>8.2f} {profit / len(sel):>7.1%}")
+
+
+
+# ---------------- SETTINGS (from your test results) ----------------
+XI_USED = 0.005        # ~4.5 month fade
+MODEL_WEIGHT = 0.05    # 5% model, 95% bookmaker (the model did not beat the bookmaker in tests)
+OVERROUND = 1.06       # margin used to ESTIMATE odds we have no data for
+HAIRCUT = 0.04         # lowers every leg probability (the model was ~5 points too confident)
+DAYS_AHEAD = 4         # only use fixtures in the next few days
+
+
+# ---------------- CANDIDATE LEGS ----------------
+def est_odds(p):
+    return max(1.01, round(1.0 / (p * OVERROUND), 2))
+
+
+def match_candidates(model, home, away, odds_hda, odds_ou=None, w=MODEL_WEIGHT):
+    """All possible legs for one match, with blended probabilities."""
+    res = model.markets(home, away)
+    mk = remove_margin(odds_hda)
+    pH = w * res["home_win"] + (1 - w) * mk[0]
+    pD = w * res["draw"] + (1 - w) * mk[1]
+    pA = w * res["away_win"] + (1 - w) * mk[2]
+    fixture = f"{home} vs {away}"
+
+    # Over 1.5: no free odds exist. Adjust the model's number using the market's
+    # view of Over 2.5 (heuristic), so it is not purely the model's opinion.
+    p15 = res["over_1_5"]
+    if odds_ou is not None:
+        mo = remove_margin(odds_ou)[0]
+        blend_o25 = w * res["over_2_5"] + (1 - w) * mo
+        under_ratio = (1 - blend_o25) / max(1 - res["over_2_5"], 1e-6)
+        p15 = float(np.clip(1 - (1 - res["over_1_5"]) * under_ratio, 0, 1))
+
+    def leg(key, label, p, odds, source):
+        return {"fixture": fixture, "teams": [home, away], "key": key, "pick": label,
+                "p": round(max(0.0, float(p) - HAIRCUT), 4), "odds": round(float(odds), 2), "odds_source": source}
+
+    return [
+        leg("home", f"{home} to win", pH, odds_hda[0], "bookmaker"),
+        leg("away", f"{away} to win", pA, odds_hda[2], "bookmaker"),
+        leg("1X", f"{home} or draw", pH + pD, est_odds(pH + pD), "estimated"),
+        leg("X2", f"{away} or draw", pD + pA, est_odds(pD + pA), "estimated"),
+        leg("o15", "Over 1.5 goals", p15, est_odds(p15), "estimated"),
+    ]
+
+
+
+# ================= ACCUMULATOR FILTER (any target odds) =================
+import os
+import re
+import sys
+import time
+import math
+import json
+import asyncio
+import logging
+import threading
+
+FLOORS = [0.68, 0.60, 0.52, 0.45, 0.38, 0.30, 0.25]  # minimum leg probability, relaxed step by step
+MIN_LEG_ODDS = 1.15
+MIN_TARGET, MAX_TARGET = 1.5, 5000.0
+
+
+def _best_combo(groups, low, high, max_legs):
+    """One option per match at most. Finds the set of legs with the highest combined
+    probability whose odds multiply to between low and high."""
+    step = max(0.002, math.log(high) / 2500)
+    B = int(math.floor(math.log(high) / step))
+    blow = int(math.ceil(math.log(low) / step))
+    K = min(len(groups), max_legs)
+    NEG = -1e18
+
+    def weight(c):
+        return int(round(math.log(c["odds"]) / step))
+
+    best = np.full((K + 1, B + 1), NEG)
+    best[0, 0] = 0.0
+    choices = []
+    for opts in groups:
+        new = best.copy()
+        ch = np.full((K + 1, B + 1), -1, dtype=np.int16)
+        for i, c in enumerate(opts):
+            w = weight(c)
+            if w <= 0 or w > B:
+                continue
+            cand = best[:-1, : B + 1 - w] + math.log(c["p"])
+            tgt = new[1:, w:]
+            chv = ch[1:, w:]
+            mask = cand > tgt
+            tgt[mask] = cand[mask]
+            chv[mask] = i
+        choices.append(ch)
+        best = new
+
+    window = best[1:, blow:B + 1]
+    if window.size == 0 or window.max() < -1e17:
+        return None
+    k_idx, b_idx = np.unravel_index(np.argmax(window), window.shape)
+    k, b = int(k_idx) + 1, int(b_idx) + blow
+    chosen = []
+    for g in range(len(groups) - 1, -1, -1):
+        i = int(choices[g][k, b])
+        if i >= 0:
+            c = groups[g][i]
+            chosen.append(c)
+            b -= weight(c)
+            k -= 1
+    return chosen
+
+
+def build_accumulator(cands, target=10.0, max_legs=40):
+    target = float(min(max(target, MIN_TARGET), MAX_TARGET))
+    # small targets are held close to what was asked; big ones get more room
+    low, high = (target * 0.95, target * 1.10) if target <= 50 else (target * 0.9, target * 1.15)
+
+    by_fix = {}
+    for c in cands:
+        if c["odds"] >= MIN_LEG_ODDS and c["p"] > 0:
+            by_fix.setdefault(c["fixture"], []).append(c)
+    if not by_fix:
+        return {"error": "no_legs"}
+
+    chosen, used_floor = None, None
+    for floor in FLOORS:
+        groups = [[c for c in legs if c["p"] >= floor] for legs in by_fix.values()]
+        groups = [g for g in groups if g]
+        if not groups:
+            continue
+        chosen = _best_combo(groups, low, high, max_legs)
+        if chosen:
+            used_floor = floor
+            break
+
+    if not chosen:
+        tops = sorted((max(l["odds"] for l in legs if l["p"] >= FLOORS[-1])
+                       for legs in by_fix.values() if any(l["p"] >= FLOORS[-1] for l in legs)),
+                      reverse=True)[:max_legs]
+        reach = float(np.prod(tops)) if tops else 0.0
+        return {"error": "unreachable", "target_odds": target, "max_odds": round(reach, 1),
+                "matches": len(by_fix)}
+
+    chosen = sorted(chosen, key=lambda c: -c["p"])
+    total = float(np.prod([c["odds"] for c in chosen]))
+    combined = float(np.prod([c["p"] for c in chosen]))
+    warnings = []
+    if used_floor < FLOORS[0]:
+        warnings.append(f"To reach {target:g} odds I had to include riskier legs "
+                        f"(down to {used_floor:.0%} chance each).")
+    if any(c["odds_source"] == "estimated" for c in chosen):
+        warnings.append("Odds marked (est.) are estimates. Check real prices before betting.")
+    return {
+        "target_odds": target,
+        "total_odds": round(total, 2),
+        "combined_probability": combined,
+        "legs": [{**{k: c[k] for k in ("fixture", "pick", "p", "odds", "odds_source", "key", "teams")},
+                  "date": c.get("date"), "div": c.get("div"), "kickoff": c.get("kickoff"),
+                  "books": c.get("books"), "best": c.get("best"), "warning": c.get("warning")} for c in chosen],
+        "warnings": warnings,
+    }
+
+
+# ================= DATA (cached) =================
+LEAGUE_CODES = {   # name: football-data division code (top leagues first)
+    "EPL": "E0", "La Liga": "SP1", "Serie A": "I1", "Bundesliga": "D1",
+    "Championship": "E1", "League One": "E2", "League Two": "E3",
+    "Serie B": "I2", "La Liga 2": "SP2", "Bundesliga 2": "D2",
+    "Ligue 1": "F1", "Ligue 2": "F2", "Eredivisie": "N1",
+    "Primeira Liga": "P1", "Super Lig": "T1",
+}
+CODE_TO_NAME = {v: k for k, v in LEAGUE_CODES.items()}
+# Division codes to keep OUT of accumulators (fill in from league_check.py), e.g. {"E3", "T1"}
+ACCA_EXCLUDE = set()
+FAIL_TTL = 900   # seconds before retrying a league whose data failed to load
+MODEL_TTL = 6 * 3600
+FIX_TTL = 3600
+_MODELS, _FX = {}, {"df": None, "t": 0.0, "saved": 0.0, "stale": False}
+_LOCKS, _GUARD, _FX_LOCK, _FAILED = {}, threading.Lock(), threading.Lock(), {}
+
+
+def load_fixtures():
+    raw = fetch_text(f"{BASE}/fixtures.csv")
+    fx = pd.read_csv(io.StringIO(raw))
+    fx.columns = [c.strip() for c in fx.columns]
+    fx["Date"] = pd.to_datetime(fx["Date"], dayfirst=True, errors="coerce")
+    return fx
+
+
+def _lock_for(code):
+    with _GUARD:
+        return _LOCKS.setdefault(code, threading.Lock())
+
+
+def get_model(code):
+    """Fitted model for a league, or None if its data could not be loaded."""
+    with _lock_for(code):
+        entry = _MODELS.get(code)
+        if entry is not None and time.time() - entry[1] <= MODEL_TTL:
+            return entry[0]
+        if time.time() - _FAILED.get(code, 0) < FAIL_TTL:
+            return entry[0] if entry else None
+        try:
+            model = DixonColes().fit(load_results(code, n_seasons=3), xi=XI_USED)
+        except Exception as e:
+            logging.warning("League %s unavailable: %s", code, e)
+            _FAILED[code] = time.time()
+            return entry[0] if entry else None
+        _MODELS[code] = (model, time.time())
+        return model
+
+
+def prefetch(codes, workers=4):
+    """Download and fit several leagues in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(get_model, codes))
+
+
+def get_fixtures():
+    with _FX_LOCK:
+        if _FX["df"] is None or time.time() - _FX["t"] > FIX_TTL:
+            try:
+                _FX["df"] = load_fixtures()
+                _FX["t"] = _FX["saved"] = time.time()
+                _FX["stale"] = False
+            except Exception as e:
+                if _FX["df"] is None:
+                    raise
+                logging.warning("Fixtures refresh failed, using the saved copy: %s", e)
+                _FX["stale"] = True
+                _FX["t"] = time.time() - FIX_TTL + 300   # try again in about 5 minutes
+        return _FX["df"]
+
+
+def row_odds(r, options):
+    """First odds set (a tuple of columns) that is complete for this fixture row."""
+    for cols in options:
+        vals = [r.get(c) for c in cols]
+        if all(v is not None and not pd.isna(v) and v > 1 for v in vals):
+            return [float(v) for v in vals]
+    return None
+
+
+# ================= KICKOFF TIMES =================
+from zoneinfo import ZoneInfo
+
+UK_TZ = ZoneInfo("Europe/London")   # football-data lists match times in UK time (assumed)
+
+
+def not_started(row, buffer_minutes=10):
+    """True if the match has not kicked off yet (with a small safety buffer)."""
+    now = pd.Timestamp.now(tz="UTC")
+    day = pd.Timestamp(row["Date"])
+    t = row.get("Time")
+    if t is not None and not pd.isna(t):
+        try:
+            hh, mm = str(t).strip().split(":")[:2]
+            ko = day.replace(hour=int(hh), minute=int(mm)).tz_localize(
+                UK_TZ, ambiguous=True, nonexistent="shift_forward").tz_convert("UTC")
+            return ko > now + pd.Timedelta(minutes=buffer_minutes)
+        except Exception:
+            pass
+    return day.date() > now.date()   # no usable time: only trust tomorrow onwards
+
+
+def kickoff_iso(row):
+    """Kickoff as a UTC ISO string, or None if the file gives no usable time."""
+    t = row.get("Time")
+    if t is None or pd.isna(t):
+        return None
+    try:
+        hh, mm = str(t).strip().split(":")[:2]
+        ko = pd.Timestamp(row["Date"]).replace(hour=int(hh), minute=int(mm)).tz_localize(
+            UK_TZ, ambiguous=True, nonexistent="shift_forward").tz_convert("UTC")
+        return ko.isoformat()
+    except Exception:
+        return None
+
+
+def kickoff_label(row):
+    label = pd.Timestamp(row["Date"]).strftime("%a %d %b")
+    t = row.get("Time")
+    if t is not None and not pd.isna(t):
+        label += f" {str(t).strip()[:5]} UK"
+    return label
+
+
+def compute_candidates(when=None):
+    """Returns (candidates, None) or (None, message for the user).
+    when = (start_date, end_date, label) or None for the default window."""
+    fx = get_fixtures()
+    if when:
+        start, end, label = pd.Timestamp(when[0]), pd.Timestamp(when[1]), when[2]
+    else:
+        start = pd.Timestamp.now().normalize()
+        end = start + pd.Timedelta(days=DAYS_AHEAD)
+        label = f"the next {DAYS_AHEAD} days"
+    fx = fx[fx["Div"].isin(set(LEAGUE_CODES.values()) - ACCA_EXCLUDE)]
+    fx = fx[(fx["Date"] >= start) & (fx["Date"] <= end)]
+    if not fx.empty:
+        fx = fx[fx.apply(not_started, axis=1)]   # drop matches that have already kicked off
+    if fx.empty:
+        return None, (f"No fixtures that haven't kicked off yet for {label}. The fixtures file is "
+                      "refreshed on Friday afternoon (weekend games) and Tuesday (midweek games).")
+    tri_opts = [c for c in TRIPLES if all(x in fx.columns for x in c)]
+    pair_opts = [c for c in PAIRS if all(x in fx.columns for x in c)]
+    if not tri_opts:
+        return None, "The fixtures have no usable odds yet. Try again closer to kick-off."
+
+    prefetch(sorted(fx["Div"].unique()))   # download and fit the leagues in parallel
+
+    cands, used = [], set()
+    for _, r in fx.sort_values("Date").iterrows():   # a team is used only once
+        h, a = r["HomeTeam"], r["AwayTeam"]
+        if not isinstance(h, str) or not isinstance(a, str) or h in used or a in used:
+            continue
+        odds = row_odds(r, tri_opts)
+        if odds is None:
+            continue
+        model = get_model(r["Div"])
+        if model is None or h not in model.idx or a not in model.idx:
+            continue
+        ou = row_odds(r, pair_opts) if pair_opts else None
+        used |= {h, a}
+        new = match_candidates(model, h, a, odds, ou)
+        for c in new:
+            c["date"] = str(r["Date"].date())
+            c["div"] = r["Div"]
+            c["kickoff"] = kickoff_label(r)
+            c["ko_utc"] = kickoff_iso(r)
+        cands += new
+    if not cands:
+        return None, "None of the listed fixtures could be matched to team data."
+    return cands, None
+
+
+def blend_with_market(res, odds_hda, odds_ou=None, w=MODEL_WEIGHT):
+    """Replace the model's win/draw/loss (and Over 2.5) with a mostly-bookmaker mix."""
+    out = dict(res)
+    mk = remove_margin(odds_hda)
+    ph = w * res["home_win"] + (1 - w) * mk[0]
+    pdr = w * res["draw"] + (1 - w) * mk[1]
+    pa = w * res["away_win"] + (1 - w) * mk[2]
+    out.update(home_win=round(float(ph), 4), draw=round(float(pdr), 4), away_win=round(float(pa), 4))
+    out["1X"], out["X2"], out["12"] = round(float(ph + pdr), 4), round(float(pdr + pa), 4), round(float(ph + pa), 4)
+    if odds_ou:
+        o25 = w * res["over_2_5"] + (1 - w) * remove_margin(odds_ou)[0]
+        ratio = (1 - o25) / max(1 - res["over_2_5"], 1e-6)
+        out["over_2_5"] = round(float(o25), 4)
+        out["over_1_5"] = round(float(np.clip(1 - (1 - res["over_1_5"]) * ratio, 0, 1)), 4)
+    out["market_blend"] = True
+    return out
+
+
+def find_fixture(res):
+    """Next listed fixture for a predicted pairing, or None."""
+    try:
+        home, away = res["fixture"].split(" vs ", 1)
+        fx = get_fixtures()
+        today = pd.Timestamp.now().normalize()
+        m = fx[(fx["HomeTeam"] == home) & (fx["AwayTeam"] == away) & (fx["Date"] >= today)]
+        if not m.empty:
+            m = m[m.apply(not_started, axis=1)]
+        if m.empty:
+            return None
+        r = m.sort_values("Date").iloc[0]
+        tri_opts = [c for c in TRIPLES if all(x in fx.columns for x in c)]
+        pair_opts = [c for c in PAIRS if all(x in fx.columns for x in c)]
+        return {"date": str(r["Date"].date()), "div": r["Div"], "home": home, "away": away,
+                "kickoff": kickoff_label(r),
+                "odds_hda": row_odds(r, tri_opts) if tri_opts else None,
+                "odds_ou": row_odds(r, pair_opts) if pair_opts else None}
+    except Exception as e:
+        logging.warning("find_fixture failed: %s", e)
+        return None
+
+
+def make_prediction(home_q, away_q):
+    prefetch(list(LEAGUE_CODES.values()))
+    for name, code in LEAGUE_CODES.items():
+        model = get_model(code)
+        if model is None:
+            continue
+        try:
+            h, a = model.resolve(home_q), model.resolve(away_q)
+        except ValueError:
+            continue
+        if h != a:
+            res = model.markets(h, a)
+            res["league"] = name
+            return res
+    return None
+
+
+# ================= MESSAGES (numbers come from Python only) =================
+HELP = (
+    "I can build accumulators and predict matches.\n\n"
+    "Accumulator: say 'acca', '2 odds', '10 odds', '50 odds' or '1000 odds'. "
+    "Add a day: 'acca 10 odds tomorrow', 'today', 'this weekend', 'saturday'. "
+    "Or use /acca 10.\n"
+    "Match: 'Arsenal vs Chelsea' or /predict Arsenal vs Chelsea.\n"
+    "Send a screenshot of your slip (or paste it after /slip) and I'll review it.\n"
+    "/stats shows how my logged picks actually did. /leagues lists the leagues I cover.\n\n"
+    "These are statistical estimates, not guarantees. Never stake money you "
+    "can't afford to lose."
+)
+
+
+def format_acca(acc, updated=False):
+    if acc.get("error") == "no_legs":
+        return "I couldn't find any usable legs right now."
+    if acc.get("error") == "unreachable":
+        return (f"I can't build {acc['target_odds']:g} odds from the {acc['matches']} matches "
+                f"available. The most I can reach is about {acc['max_odds']:g}. "
+                "Try a smaller target.")
+    p = acc["combined_probability"]
+    one_in = max(1, round(1 / p)) if p > 0 else 0
+    title = "Updated accumulator with real odds" if updated else "Accumulator"
+    lines = [f"{title}, about {acc['target_odds']:g} odds",
+             f"Total odds: {acc['total_odds']:.2f}",
+             f"Chance every leg wins: {p:.2%} (about 1 in {one_in:,})", ""]
+    for i, leg in enumerate(acc["legs"], 1):
+        if leg.get("books"):
+            tag = f" (median of {leg['books']} bookmakers, best {leg['best']:.2f})"
+        elif leg["odds_source"] == "estimated":
+            tag = " (est.)"
+        else:
+            tag = ""
+        lines.append(f"{i}. {leg['pick']} - {leg['fixture']}")
+        ko = f" | {leg['kickoff']}" if leg.get("kickoff") else ""
+        lines.append(f"   chance {leg['p']:.0%} | odds {leg['odds']:.2f}{tag}{ko}")
+        if leg.get("warning"):
+            lines.append(f"   {leg['warning']}")
+    lines.append("")
+    lines += acc["warnings"]
+    lines.append("Based mostly on bookmaker odds. Estimates, not guarantees.")
+    return "\n".join(lines)
+
+
+def format_prediction(res):
+    if res.get("market_blend"):
+        note = ("Mostly bookmaker odds (the model's share is small). Injuries and lineups "
+                "are not included.")
+    else:
+        note = ("Model only: no bookmaker odds were found for this match, and the model alone "
+                "was less accurate than bookmaker odds in tests. Injuries and lineups are not included.")
+
+    def fo(k):
+        return f"{1 / res[k]:.2f}" if res[k] > 0 else "-"
+    return (
+        f"{res['fixture']} ({res.get('league', '')})\n"
+        f"Expected goals: {res['home_xg']} - {res['away_xg']}\n\n"
+        f"Home win {res['home_win']:.0%} | Draw {res['draw']:.0%} | Away win {res['away_win']:.0%}\n"
+        f"Home or draw {res['1X']:.0%} | Draw or away {res['X2']:.0%}\n"
+        f"Over 1.5 goals {res['over_1_5']:.0%} | Over 2.5 goals {res['over_2_5']:.0%}\n"
+        f"Both teams score {res['btts']:.0%}\n\n"
+        f"Fair odds: home {fo('home_win')}, draw {fo('draw')}, away {fo('away_win')}\n"
+        + note
+    )
+
+
+# ================= UNDERSTANDING MESSAGES =================
+ACCA_WORDS = ("acca", "accumulator", "accy", "accum", "slip", "ticket", "parlay", "odds")
+
+
+def parse_target(text):
+    t = text.lower().replace(",", "")
+    m = (re.search(r"(\d+(?:\.\d+)?)\s*(k)?\s*(?:odds?|x)\b", t)
+         or re.search(r"(?:odds?|acca|accumulator|accy|slip|ticket|parlay)\D{0,12}?(\d+(?:\.\d+)?)\s*(k)?\b", t)
+         or re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(k)?\s*", t))
+    if not m:
+        return None
+    return float(m.group(1)) * (1000 if m.group(2) else 1)
+
+
+def parse_match(text):
+    m = re.search(r"(.+?)\s+(?:vs\.?|v\.?|versus|against)\s+(.+)", text.strip(), flags=re.I)
+    if not m:
+        return None
+    home = m.group(1).strip()
+    home = re.sub(r"^(?:please\s+)?(?:what(?:'s|\s+is|\s+are)?\s+(?:the\s+)?)?"
+                  r"(?:odds|chances?|prediction|tip)\s+(?:for|of|on)\s+", "", home, flags=re.I)
+    home = re.sub(r"^(?:please\s+)?(?:predict|prediction|tip|pick|analy[sz]e|who wins|who will win"
+                  r"|what about|how about)[:\s]+", "", home, flags=re.I)
+    away = re.sub(r"[?!.]+$", "", m.group(2).strip())
+    return (home.strip(), away.strip()) if home.strip() and away.strip() else None
+
+
+async def classify_with_gemini(text):
+    prompt = (
+        "You read messages sent to a football odds bot. Reply with JSON only:\n"
+        '{"intent": "acca" or "predict" or "help" or "other", "target_odds": number or null, '
+        '"home": string or null, "away": string or null}\n'
+        "acca = the user wants an accumulator (multi-bet slip), maybe with a total odds target "
+        "such as '2 odds', '50 odds' or '1k odds' (1k means 1000). "
+        "predict = the user wants the chances for one match; fill in home and away team names. "
+        "help = the user asks what the bot can do. other = anything else.\n"
+        f"Message: {text}"
+    )
+    resp = await client.aio.models.generate_content(
+        model=GEMINI_MODEL, contents=prompt, config={"response_mime_type": "application/json"})
+    raw = re.sub(r"^```(?:json)?|```$", "", resp.text.strip(), flags=re.M).strip()
+    data = json.loads(raw)
+    intent = data.get("intent")
+    if intent not in ("acca", "predict", "help", "other"):
+        return {"intent": "other"}
+    out = {"intent": intent}
+    try:
+        out["target"] = float(data["target_odds"]) if data.get("target_odds") is not None else None
+    except (TypeError, ValueError):
+        out["target"] = None
+    out["home"], out["away"] = data.get("home"), data.get("away")
+    return out
+
+
+async def understand(text):
+    low = text.lower()
+    target, match = parse_target(text), parse_match(text)
+    if match and target is None:
+        return {"intent": "predict", "home": match[0], "away": match[1]}
+    if any(w in low for w in ACCA_WORDS):
+        return {"intent": "acca", "target": target}
+    try:
+        return await classify_with_gemini(text)
+    except Exception as e:
+        logging.error("Gemini parse error: %s", e)
+        return {"intent": "other"}
+
+
+# ================= DATES =================
+from datetime import date, timedelta
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def parse_when(text):
+    """Understands today, tonight, tomorrow, this weekend, a weekday name, 'next N days'.
+    Returns (start_date, end_date, label) or None."""
+    low = text.lower()
+    today = date.today()
+    wd = today.weekday()
+    if "tomorrow" in low:
+        d = today + timedelta(days=1)
+        return d, d, "tomorrow"
+    if "today" in low or "tonight" in low:
+        return today, today, "today"
+    if "weekend" in low:
+        if wd == 6:
+            return today, today, "this weekend"
+        start = today if wd == 5 else today + timedelta(days=5 - wd)
+        return start, start + timedelta(days=1), "this weekend"
+    m = re.search(r"next\s+(\d+)\s+days?", low)
+    if m:
+        n = min(int(m.group(1)), 14)
+        return today, today + timedelta(days=n), f"the next {n} days"
+    for i, name in enumerate(WEEKDAYS):
+        if name in low:
+            d = today + timedelta(days=(i - wd) % 7)
+            if d == today and "next" in low:
+                d += timedelta(days=7)
+            return d, d, name.capitalize()
+    return None
+
+
+# ================= PREDICTION LOG (SQLite) =================
+import sqlite3
+import uuid
+
+try:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+except NameError:   # some phone editors run the file without __file__
+    _HERE = os.getcwd()
+# On a host, set DB_PATH to a folder that survives restarts (a persistent disk or volume).
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(_HERE, "football_bot.db")
+
+
+def db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.execute("""CREATE TABLE IF NOT EXISTS legs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, kind TEXT, acca_id TEXT, fp TEXT,
+        match_date TEXT, div TEXT, home TEXT, away TEXT, mkey TEXT, pick TEXT,
+        p REAL, odds REAL, odds_source TEXT, result INTEGER)""")
+    return con
+
+
+def leg_hit(key, hg, ag):
+    return {"home": hg > ag, "away": hg < ag, "draw": hg == ag, "1X": hg >= ag, "X2": hg <= ag,
+            "o15": hg + ag >= 2, "o25": hg + ag >= 3, "btts": hg > 0 and ag > 0,
+            "12": hg != ag, "u15": hg + ag <= 1, "u25": hg + ag <= 2,
+            "nobtts": not (hg > 0 and ag > 0)}[key]
+
+
+def log_acca(acc, kind="acca"):
+    legs = acc.get("legs") or []
+    if not legs:
+        return None
+    fp = "|".join(sorted(f"{l['fixture']}:{l['key']}:{l['date']}" for l in legs))
+    con = db()
+    try:
+        if con.execute("SELECT 1 FROM legs WHERE kind=? AND fp=? AND result IS NULL LIMIT 1",
+                       (kind, fp)).fetchone():
+            return None   # same slip already logged and still waiting for results
+        acca_id = uuid.uuid4().hex[:8]
+        now = datetime.now().isoformat(timespec="seconds")
+        for l in legs:
+            home, away = l["teams"]
+            con.execute("INSERT INTO legs (created_at, kind, acca_id, fp, match_date, div, home, away,"
+                        " mkey, pick, p, odds, odds_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (now, kind, acca_id, fp, l["date"], l["div"], home, away, l["key"],
+                         l["pick"], l["p"], l["odds"], l["odds_source"]))
+        con.commit()
+        return acca_id
+    finally:
+        con.close()
+
+
+def log_single(res, fx):
+    """Log the model-only probabilities of a /predict for a match with a known date."""
+    h, a = fx["home"], fx["away"]
+    items = [("home", "home_win", f"{h} to win"), ("draw", "draw", "Draw"),
+             ("away", "away_win", f"{a} to win"), ("o15", "over_1_5", "Over 1.5 goals"),
+             ("o25", "over_2_5", "Over 2.5 goals"), ("btts", "btts", "Both teams score")]
+    con = db()
+    try:
+        if con.execute("SELECT 1 FROM legs WHERE kind='single' AND home=? AND away=? AND match_date=?"
+                       " AND result IS NULL LIMIT 1", (h, a, fx["date"])).fetchone():
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        for key, field, label in items:
+            con.execute("INSERT INTO legs (created_at, kind, match_date, div, home, away, mkey, pick, p)"
+                        " VALUES (?,?,?,?,?,?,?,?,?)",
+                        (now, "single", fx["date"], fx["div"], h, a, key, label, res[field]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def settle_pending():
+    """Look up finished matches in the results files and mark logged legs hit or missed."""
+    con = db()
+    try:
+        rows = con.execute("SELECT id, match_date, div, home, away, mkey FROM legs WHERE result IS NULL"
+                           " AND match_date IS NOT NULL AND match_date <= ?",
+                           (date.today().isoformat(),)).fetchall()
+        by_div = {}
+        for r in rows:
+            by_div.setdefault(r[2], []).append(r)
+        settled = 0
+        for code, items in by_div.items():
+            try:
+                df = load_results(code, n_seasons=2)
+            except Exception as e:
+                logging.warning("settle: could not load %s: %s", code, e)
+                continue
+            for rid, md, _, home, away, mkey in items:
+                d0 = pd.Timestamp(md)
+                m = df[(df["HomeTeam"] == home) & (df["AwayTeam"] == away)
+                       & ((df["Date"] - d0).abs() <= pd.Timedelta(days=1))]
+                if m.empty:
+                    continue   # not in the results file yet
+                hg, ag = int(m.iloc[0]["FTHG"]), int(m.iloc[0]["FTAG"])
+                con.execute("UPDATE legs SET result=? WHERE id=?", (int(leg_hit(mkey, hg, ag)), rid))
+                settled += 1
+        con.commit()
+        return settled
+    finally:
+        con.close()
+
+
+def stats_text():
+    con = db()
+    try:
+        pending = con.execute("SELECT COUNT(*) FROM legs WHERE result IS NULL").fetchone()[0]
+        lines = ["Prediction log"]
+        bands = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 1.01)]
+        any_data = False
+        for kind, label in (("acca", "Accumulator legs"), ("single", "Match predictions"),
+                            ("review", "Legs from slips you sent")):
+            rows = con.execute("SELECT p, result FROM legs WHERE kind=? AND result IS NOT NULL",
+                               (kind,)).fetchall()
+            if not rows:
+                continue
+            any_data = True
+            ps = np.array([r[0] for r in rows])
+            hs = np.array([r[1] for r in rows], dtype=float)
+            lines += ["", f"{label}: {len(rows)} settled",
+                      f"Predicted {ps.mean():.1%} | actually hit {hs.mean():.1%}"]
+            for lo, hi in bands:
+                mask = (ps >= lo) & (ps < hi)
+                if mask.sum() >= 5:
+                    lines.append(f"  {lo:.0%}-{min(hi, 1):.0%}: predicted {ps[mask].mean():.0%}, "
+                                 f"hit {hs[mask].mean():.0%} ({int(mask.sum())})")
+        rows = con.execute("SELECT acca_id, p, result FROM legs WHERE kind IN ('acca','review')").fetchall()
+        slips = {}
+        for aid, p, r in rows:
+            slips.setdefault(aid, []).append((p, r))
+        done = [v for v in slips.values() if all(r is not None for _, r in v)]
+        if done:
+            won = sum(all(r == 1 for _, r in v) for v in done)
+            exp = sum(float(np.prod([p for p, _ in v])) for v in done)
+            lines += ["", f"Accumulators settled: {len(done)} | won {won} | model expected about {exp:.1f}"]
+        if not any_data and not done:
+            lines += ["", "Nothing settled yet. Picks are logged when you ask for an accumulator or a "
+                          "/predict for a listed fixture, and settle after the match appears in the "
+                          "results file (updated about twice a week)."]
+        last = con.execute("SELECT acca_id, MIN(created_at) FROM legs WHERE kind IN ('acca','review') "
+                           "GROUP BY acca_id ORDER BY MIN(created_at) DESC LIMIT 3").fetchall()
+        if last:
+            lines += ["", "Last slips"]
+        for aid, created in last:
+            legs = con.execute("SELECT pick, home, away, result FROM legs WHERE acca_id=? ORDER BY id",
+                               (aid,)).fetchall()
+            done = [l for l in legs if l[3] is not None]
+            hits = sum(1 for l in done if l[3] == 1)
+            state = "waiting" if len(done) < len(legs) else ("WON" if hits == len(legs) else "lost")
+            lines.append(f"{created[:10]}: {hits}/{len(legs)} legs hit ({state})")
+            for pick, h, a, r in legs:
+                mark = "\u2705" if r == 1 else ("\u274C" if r == 0 else "\u23F3")
+                lines.append(f"  {mark} {pick} ({h} vs {a})")
+        lines += ["", f"Waiting for results: {pending} legs"]
+        return "\n".join(lines)
+    finally:
+        con.close()
+
+
+# ================= LOG BACKUP IN A PRIVATE GITHUB REPO (for free hosts that wipe files) =================
+import base64
+import urllib.error
+
+GH_TOKEN = os.environ.get("GITHUB_TOKEN")
+GH_REPO = os.environ.get("GITHUB_DATA_REPO")            # "your-name/your-private-data-repo"
+GH_PATH = os.environ.get("GITHUB_DATA_PATH", "football_bot.db")
+GH_BRANCH = os.environ.get("GITHUB_DATA_BRANCH", "main")
+_SYNC_LOCK = threading.Lock()
+
+
+def _gh_request(method, payload=None):
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+    if method == "GET":
+        url += f"?ref={GH_BRANCH}"
+    req = urllib.request.Request(
+        url, method=method, data=json.dumps(payload).encode() if payload else None,
+        headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json",
+                 "User-Agent": "football-bot", "X-GitHub-Api-Version": "2022-11-28"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode())
+
+
+def restore_db():
+    """Download the saved log at startup. Does nothing if the backup is not configured."""
+    if not (GH_TOKEN and GH_REPO):
+        return False
+    try:
+        info = _gh_request("GET")
+        if not info.get("content"):
+            logging.warning("Backup file is too large for the contents API; starting without it.")
+            return False
+        os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+        with open(DB_PATH, "wb") as f:
+            f.write(base64.b64decode(info["content"]))
+        logging.info("Prediction log restored from GitHub.")
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            logging.warning("Could not restore the log: %s", e)
+    except Exception as e:
+        logging.warning("Could not restore the log: %s", e)
+    return False
+
+
+def _err_text(e):
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            msg = json.loads(e.read().decode()).get("message", "")
+        except Exception:
+            msg = ""
+        return f"GitHub said {e.code}: {msg}".strip()
+    return str(e)
+
+
+def push_db():
+    """Upload the log after a change. Never raises. Returns (ok, message)."""
+    if not (GH_TOKEN and GH_REPO):
+        return False, "GITHUB_TOKEN or GITHUB_DATA_REPO is not set in the host settings."
+    if not os.path.exists(DB_PATH):
+        return False, "There is no log yet. Ask for an accumulator first."
+    with _SYNC_LOCK:
+        try:
+            with open(DB_PATH, "rb") as f:
+                raw = f.read()
+            sha = None
+            try:
+                sha = _gh_request("GET").get("sha")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+            payload = {"message": "update prediction log", "branch": GH_BRANCH,
+                       "content": base64.b64encode(raw).decode()}
+            if sha:
+                payload["sha"] = sha
+            _gh_request("PUT", payload)
+            return True, f"Saved {GH_PATH} to {GH_REPO}."
+        except Exception as e:
+            text = _err_text(e)
+            logging.warning("Could not back up the log: %s", text)
+            return False, text
+
+
+def reset_log():
+    con = db()
+    try:
+        n = con.execute("SELECT COUNT(*) FROM legs").fetchone()[0]
+        con.execute("DELETE FROM legs")
+        con.commit()
+        return n
+    finally:
+        con.close()
+
+
+# ================= SLIP REVIEW =================
+SLIP_PICKS = {"home", "draw", "away", "1X", "X2", "12", "over1.5", "over2.5", "under1.5",
+              "under2.5", "btts_yes", "btts_no"}
+
+
+def leg_probability(res, pick):
+    """(probability, settle key, label) for a pick, or None if the market is not supported."""
+    h, a = res["fixture"].split(" vs ", 1)
+    table = {
+        "home": (res["home_win"], "home", f"{h} to win"),
+        "draw": (res["draw"], "draw", "Draw"),
+        "away": (res["away_win"], "away", f"{a} to win"),
+        "1X": (res["1X"], "1X", f"{h} or draw"),
+        "X2": (res["X2"], "X2", f"{a} or draw"),
+        "12": (res["12"], "12", "Either team to win"),
+        "over1.5": (res["over_1_5"], "o15", "Over 1.5 goals"),
+        "over2.5": (res["over_2_5"], "o25", "Over 2.5 goals"),
+        "under1.5": (1 - res["over_1_5"], "u15", "Under 1.5 goals"),
+        "under2.5": (1 - res["over_2_5"], "u25", "Under 2.5 goals"),
+        "btts_yes": (res["btts"], "btts", "Both teams score"),
+        "btts_no": (1 - res["btts"], "nobtts", "Both teams do not score"),
+    }
+    return table.get(pick)
+
+
+async def parse_slip(image_bytes=None, text=None):
+    """Gemini only READS the slip (teams, picks, odds). All the maths happens in Python."""
+    prompt = (
+        "This is a football betting slip, as a screenshot or pasted text. Extract every leg. "
+        "Reply with JSON only: "
+        '{"legs": [{"home": string, "away": string, "pick": one of "home","draw","away","1X","X2","12",'
+        '"over1.5","over2.5","under1.5","under2.5","btts_yes","btts_no","other", "odds": number or null}]}. '
+        "Use team names exactly as printed. In a 1X2 market, Home/Away/Draw map to home/away/draw. "
+        "Use pick 'other' for any market not in the list (handicaps, other goal lines, half-time, etc). "
+        "Do not invent anything that is not on the slip."
+    )
+    if text:
+        prompt += f"\nSlip text:\n{text}"
+    parts = []
+    if image_bytes:
+        parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+    parts.append(prompt)
+    last = None
+    for attempt in range(3):   # Gemini is sometimes briefly unavailable
+        try:
+            resp = await client.aio.models.generate_content(
+                model=GEMINI_MODEL, contents=parts, config={"response_mime_type": "application/json"})
+            raw = re.sub(r"^```(?:json)?|```$", "", resp.text.strip(), flags=re.M).strip()
+            data = json.loads(raw)
+            legs = []
+            for l in data.get("legs", []):
+                if isinstance(l.get("home"), str) and isinstance(l.get("away"), str):
+                    try:
+                        odds = float(l["odds"]) if l.get("odds") is not None else None
+                    except (TypeError, ValueError):
+                        odds = None
+                    pick = l.get("pick") if l.get("pick") in SLIP_PICKS else "other"
+                    legs.append({"home": l["home"].strip(), "away": l["away"].strip(),
+                                 "pick": pick, "odds": odds if odds and odds > 1 else None})
+            return legs
+        except Exception as e:
+            last = e
+            await asyncio.sleep(2 * (attempt + 1))
+    raise last
+
+
+def analyze_slip(legs):
+    rows = []
+    for leg in legs:
+        row = dict(leg, status="ok")
+        if leg["pick"] == "other":
+            row["status"] = "unsupported"
+        else:
+            res = make_prediction(leg["home"], leg["away"])
+            if res is None:
+                row["status"] = "not_found"
+            else:
+                fx = find_fixture(res)
+                row["source"] = "model only"
+                if fx and fx.get("odds_hda"):
+                    res = blend_with_market(res, fx["odds_hda"], fx.get("odds_ou"))
+                    row["source"] = "bookmaker odds"
+                p, key, label = leg_probability(res, leg["pick"])
+                row.update(p=float(p), key=key, label=label, fixture=res["fixture"], fx=fx)
+        rows.append(row)
+    return rows
+
+
+def format_slip_review(rows):
+    lines = ["Slip review", "(Check that I read your slip correctly.)", ""]
+    ok = [r for r in rows if r["status"] == "ok"]
+    for i, r in enumerate(rows, 1):
+        odds = f" @{r['odds']:.2f}" if r.get("odds") else ""
+        lines.append(f"{i}. {r['home']} vs {r['away']} - {r['pick']}{odds}")
+        if r["status"] == "unsupported":
+            lines.append("   I can't evaluate this market.")
+        elif r["status"] == "not_found":
+            lines.append("   Teams not found in my leagues.")
+        else:
+            fair = 1 / r["p"] if r["p"] > 0 else 0
+            line = f"   chance {r['p']:.0%} | fair odds {fair:.2f} | {r['source']}"
+            if r.get("odds"):
+                value = r["p"] * r["odds"] - 1
+                line += f" | your price {'above' if value >= 0 else 'below'} fair by {abs(value):.0%}"
+            lines.append(line)
+    if ok:
+        p_all = float(np.prod([r["p"] for r in ok]))
+        priced = [r for r in ok if r.get("odds")]
+        lines.append("")
+        lines.append(f"Chance all {len(ok)} legs I could evaluate win: {p_all:.1%} (about 1 in {max(1, round(1 / p_all)):,})")
+        if priced and len(priced) == len(rows):
+            total = float(np.prod([r["odds"] for r in priced]))
+            lines.append(f"Your total odds: {total:.2f}. On average you'd get back about {p_all * total:.2f} "
+                         "for every 1 staked.")
+        if len(ok) > 1:
+            weakest = min(ok, key=lambda r: r["p"])
+            rest = [r for r in ok if r is not weakest]
+            p_rest = float(np.prod([r["p"] for r in rest]))
+            extra = ""
+            if all(r.get("odds") for r in rest) and len(rest) == len(rows) - 1:
+                extra = f", odds {np.prod([r['odds'] for r in rest]):.2f}"
+            lines.append(f"Weakest leg: {weakest['home']} vs {weakest['away']} ({weakest['p']:.0%}). "
+                         f"Without it: chance {p_rest:.1%}{extra}.")
+    if any(r["status"] != "ok" for r in rows):
+        lines.append("Legs I couldn't evaluate are left out of the totals above.")
+    lines.append("")
+    lines.append("Probabilities come from bookmaker odds listed on football-data (often a few days old) "
+                 "or the model alone, not from SportyBet's current prices. Estimates, not guarantees.")
+    return "\n".join(lines)
+
+
+def slip_to_acca(rows):
+    legs = []
+    for r in rows:
+        fx = r.get("fx")
+        if r["status"] == "ok" and fx:
+            legs.append({"fixture": r["fixture"], "teams": [fx["home"], fx["away"]], "key": r["key"],
+                         "pick": r["label"], "p": r["p"], "odds": r.get("odds"),
+                         "odds_source": "user", "date": fx["date"], "div": fx["div"]})
+    return {"legs": legs} if legs else None
+
+
+# ================= API-FOOTBALL: real odds + injuries for the matches in a slip =================
+import difflib
+import statistics
+import unicodedata
+import urllib.parse
+
+AF_KEY = os.environ.get("API_FOOTBALL_KEY")
+AF_BASE = "https://v3.football.api-sports.io"
+AF_MIN_GAP = 6.5          # seconds between requests (the free plan allows 10 a minute)
+AF_DAILY_CAP = 90         # stop before the 100-a-day limit
+AF_DEADLINE = 110         # seconds spent fetching before we stop waiting
+AF_HARD_TIMEOUT = 150     # absolute limit for the whole check
+AF_CACHE_TTL = 3 * 3600
+AF_EXTRA = 3              # extra matches checked beyond the slip, to give the rebuild some choice
+AF_LEAGUE_IDS = {"E0": 39, "E1": 40, "E2": 41, "E3": 42, "SP1": 140, "SP2": 141, "I1": 135, "I2": 136,
+                 "D1": 78, "D2": 79, "F1": 61, "F2": 62, "N1": 88, "P1": 94, "T1": 203}
+AF_STOP = {"fc", "cf", "sk", "afc", "sv", "ac", "as", "fk", "ud", "cd", "sc", "ssc", "bsc", "fsv", "tsg",
+           "vfb", "vfl", "if", "bk", "club", "de", "the"}
+AF_ABBR = {"man": "manchester", "utd": "united", "nott": "nottingham", "ath": "athletic"}
+INCOMING_MSG = ("A new slip is incoming. I'm checking real bookmaker odds and injuries for these "
+                "matches. This takes 1 to 2 minutes.")
+SLOW_MSG = ("The odds service is slow right now, so I'm not waiting any longer. The slip above still "
+            "stands (some odds are estimates). Try again later for real odds.")
+AF_NUDGE = 60             # seconds before the "still checking" nudge
+NUDGE_MSG = ("Still checking. The odds service is slow right now. If it isn't done soon I'll stop waiting, "
+             "and your first slip stays valid.")
+SLOW_PARTIAL_MSG = ("The odds service was slow, so I stopped waiting. Matches I couldn't check keep their "
+                    "estimated odds (marked est.).")
+_AF = {"lock": threading.Lock(), "last": 0.0, "day": "", "used": 0, "left": None}
+_AF_CACHE = {}
+
+
+def af_enabled():
+    return bool(AF_KEY)
+
+
+def af_call(path, params, stop=None, cache=True):
+    """Rate-limited, budgeted, cached call. Returns (response_list, error_text)."""
+    key = (path, tuple(sorted(params.items())))
+    hit = _AF_CACHE.get(key)
+    if hit and time.time() - hit[0] < AF_CACHE_TTL:
+        return hit[1], None
+    with _AF["lock"]:
+        if stop is not None and stop.is_set():
+            return None, "stopped"
+        today = date.today().isoformat()
+        if _AF["day"] != today:
+            _AF.update(day=today, used=0, left=None)
+        if _AF["used"] >= AF_DAILY_CAP or (_AF["left"] is not None and _AF["left"] < 5):
+            return None, "limit"
+        wait = AF_MIN_GAP - (time.time() - _AF["last"])
+        if wait > 0:
+            time.sleep(wait)
+        if stop is not None and stop.is_set():
+            return None, "stopped"
+        url = AF_BASE + path + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"x-apisports-key": AF_KEY, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                left = resp.headers.get("x-ratelimit-requests-remaining")
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            _AF["last"] = time.time()
+            return None, f"network: {type(e).__name__}"
+        _AF["last"] = time.time()
+        _AF["used"] += 1
+        if left is not None and str(left).isdigit():
+            _AF["left"] = int(left)
+        if data.get("errors"):
+            return None, "api-error"
+        resp_list = data.get("response", [])
+        if cache:
+            _AF_CACHE[key] = (time.time(), resp_list)
+        return resp_list, None
+
+
+def af_fixtures(day, stop):
+    """Fixtures of one day, reduced to your 15 leagues (the raw answer is large)."""
+    key = ("fx", day)
+    hit = _AF_CACHE.get(key)
+    if hit and time.time() - hit[0] < AF_CACHE_TTL:
+        return hit[1]
+    raw, err = af_call("/fixtures", {"date": day}, stop, cache=False)
+    if err:
+        return None
+    keep = set(AF_LEAGUE_IDS.values())
+    out = [{"id": f["fixture"]["id"], "league": f["league"]["id"], "date": f["fixture"]["date"],
+            "home": f["teams"]["home"]["name"], "away": f["teams"]["away"]["name"]}
+           for f in raw if f["league"]["id"] in keep]
+    _AF_CACHE[key] = (time.time(), out)
+    return out
+
+
+def af_injuries(day, stop):
+    key = ("inj", day)
+    hit = _AF_CACHE.get(key)
+    if hit and time.time() - hit[0] < AF_CACHE_TTL:
+        return hit[1]
+    raw, err = af_call("/injuries", {"date": day}, stop, cache=False)
+    if err:
+        return None
+    out = [{"fid": i["fixture"]["id"], "team": i["team"]["name"], "player": i["player"]["name"],
+            "type": i["player"].get("type"), "reason": i["player"].get("reason")} for i in raw]
+    _AF_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _norm(name):
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    toks = [AF_ABBR.get(t, t) for t in s.split() if len(t) > 1 and t not in AF_STOP and not t.isdigit()]
+    return toks or s.split()
+
+
+def name_sim(a, b):
+    ta, tb = _norm(a), _norm(b)
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if not short:
+        return 0.0
+    hits = 0
+    for t in short:
+        for u in long_:
+            if (u == t or (len(t) >= 3 and (u.startswith(t) or t.startswith(u)))
+                    or difflib.SequenceMatcher(None, t, u).ratio() >= 0.8):
+                hits += 1
+                break
+    ratio = difflib.SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio()
+    return max(0.95 * hits / len(short), ratio)
+
+
+def match_af_fixture(af_list, league_id, teams, ko_utc=None):
+    """Find the API fixture for a football-data match: same league, close names, close kickoff."""
+    home, away = teams
+    scored = []
+    for f in af_list:
+        if f["league"] != league_id:
+            continue
+        if ko_utc:
+            try:
+                gap = abs((pd.Timestamp(f["date"]) - pd.Timestamp(ko_utc)).total_seconds())
+                if gap > 3 * 3600:
+                    continue
+            except Exception:
+                pass
+        scored.append((name_sim(home, f["home"]) + name_sim(away, f["away"]), f))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    best = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    if best[0] >= 1.2 and best[0] - second >= 0.25:
+        return best[1]
+    return None
+
+
+def _num(x):
+    try:
+        return float(x) > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def parse_api_odds(item):
+    """Consensus probability and median odds per leg type, from up to ~10 bookmakers."""
+    acc = {k: {"p": [], "odds": []} for k in ("home", "away", "1X", "X2", "o15")}
+    for bk in item.get("bookmakers", []):
+        bets = {}
+        for b in bk.get("bets", []):
+            if b.get("name") in ("Match Winner", "Double Chance", "Goals Over/Under"):
+                bets[b["name"]] = {v["value"]: float(v["odd"]) for v in b.get("values", []) if _num(v.get("odd"))}
+        mw = bets.get("Match Winner", {})
+        if all(k in mw for k in ("Home", "Draw", "Away")):
+            inv = {k: 1 / mw[k] for k in ("Home", "Draw", "Away")}
+            tot = sum(inv.values())
+            for key, label in (("home", "Home"), ("away", "Away")):
+                acc[key]["p"].append(inv[label] / tot)
+                acc[key]["odds"].append(mw[label])
+        dc = bets.get("Double Chance", {})
+        if all(k in dc for k in ("Home/Draw", "Draw/Away", "Home/Away")):
+            inv = {k: 1 / dc[k] for k in ("Home/Draw", "Draw/Away", "Home/Away")}
+            tot = sum(inv.values())
+            for key, label in (("1X", "Home/Draw"), ("X2", "Draw/Away")):
+                acc[key]["p"].append(2 * inv[label] / tot)   # the three outcomes overlap: they sum to 2
+                acc[key]["odds"].append(dc[label])
+        ou = bets.get("Goals Over/Under", {})
+        if "Over 1.5" in ou and "Under 1.5" in ou:
+            io, iu = 1 / ou["Over 1.5"], 1 / ou["Under 1.5"]
+            acc["o15"]["p"].append(io / (io + iu))
+            acc["o15"]["odds"].append(ou["Over 1.5"])
+    out = {}
+    for key, d in acc.items():
+        if len(d["odds"]) >= 3:   # need at least 3 bookmakers
+            out[key] = {"p": statistics.median(d["p"]), "odds": statistics.median(d["odds"]),
+                        "best": max(d["odds"]), "books": len(d["odds"])}
+    return out
+
+
+def injury_warning(entries, fid):
+    mine = [e for e in entries if e["fid"] == fid]
+    parts, big = [], False
+    for team in sorted({e["team"] for e in mine}):
+        rows = [e for e in mine if e["team"] == team]
+        out = [e for e in rows if e["type"] == "Missing Fixture"]
+        doubt = [e for e in rows if e["type"] == "Questionable"]
+
+        def names(lst):
+            shown = ", ".join(e["player"] for e in lst[:3])
+            return shown + (f" +{len(lst) - 3} more" if len(lst) > 3 else "")
+        text = f"{team}: "
+        if out:
+            text += "out " + names(out)
+        if doubt:
+            text += ("; " if out else "") + "doubtful " + names(doubt)
+        if out or doubt:
+            parts.append(text)
+        if len(out) + len(doubt) >= 4:
+            big = True
+    if not parts:
+        return None
+    return ("\u26A0\uFE0F\u26A0\uFE0F MANY ABSENCES - " if big else "\u26A0\uFE0F ") + " | ".join(parts)
+
+
+def slip_diff(first, second):
+    a = {l["fixture"]: l["pick"] for l in first["legs"]}
+    b = {l["fixture"]: l["pick"] for l in second["legs"]}
+    dropped = [f for f in a if f not in b]
+    added = [f for f in b if f not in a]
+    changed = [f for f in b if f in a and a[f] != b[f]]
+    if not (dropped or added or changed):
+        return "Same matches and picks as the first slip."
+    lines = ["Changes from the first slip:"]
+    lines += [f"  dropped: {f}" for f in dropped]
+    lines += [f"  added: {f} - {b[f]}" for f in added]
+    lines += [f"  pick changed: {f} - {b[f]}" for f in changed]
+    return "\n".join(lines)
+
+
+def enrich_and_rebuild(cands, first_acc, target, stop):
+    """Runs in a worker thread. Returns {"status": ..., "acc": ..., "checked": n, "total": m}."""
+    start = time.time()
+    by_fix = {}
+    for c in cands:
+        by_fix.setdefault(c["fixture"], []).append(c)
+    in_slip = [l["fixture"] for l in first_acc["legs"]]
+    extras = sorted((f for f in by_fix if f not in in_slip),
+                    key=lambda f: -max(c["p"] for c in by_fix[f]))[:AF_EXTRA]
+    targets = in_slip + extras
+    afx, enriched, limit_hit, slow, down = {}, {}, False, False, False
+
+    for f in targets:
+        if stop.is_set() or time.time() - start > AF_DEADLINE:
+            slow = True
+            break
+        sample = by_fix[f][0]
+        day = sample["date"]
+        if day not in afx:
+            afx[day] = af_fixtures(day, stop)
+        if afx[day] is None:
+            limit_hit = limit_hit or _AF["used"] >= AF_DAILY_CAP
+            down = down or not limit_hit
+            continue
+        m = match_af_fixture(afx[day], AF_LEAGUE_IDS.get(sample["div"], -1), sample["teams"], sample.get("ko_utc"))
+        if m is None:
+            continue
+        items, err = af_call("/odds", {"fixture": m["id"]}, stop)
+        if err == "limit":
+            limit_hit = True
+            break
+        if err or not items:
+            continue
+        parsed = parse_api_odds(items[0])
+        if parsed:
+            enriched[f] = {"fid": m["id"], "legs": parsed, "day": day}
+
+    if not enriched:
+        return {"status": "limit" if limit_hit else ("slow" if slow else ("down" if down else "none"))}
+
+    injuries = {}
+    for day in sorted({e["day"] for e in enriched.values()}):
+        if stop.is_set() or time.time() - start > AF_DEADLINE:
+            slow = True
+            break
+        injuries[day] = af_injuries(day, stop) or []
+
+    pool = []
+    for f in targets:
+        info = enriched.get(f)
+        warn = injury_warning(injuries.get(info["day"], []), info["fid"]) if info else None
+        for c in by_fix[f]:
+            c2 = dict(c)
+            if info and c["key"] in info["legs"]:
+                a = info["legs"][c["key"]]
+                c2.update(p=max(0.0, a["p"] - HAIRCUT), odds=round(a["odds"], 2), odds_source="api",
+                          books=a["books"], best=round(a["best"], 2))
+            c2["warning"] = warn
+            pool.append(c2)
+    acc2 = build_accumulator(pool, target)
+    if "legs" not in acc2:
+        return {"status": "none"}
+    return {"status": "ok", "acc": acc2, "checked": len(enriched), "total": len(targets), "slow": slow}
+
+
+# ================= TELEGRAM =================
+def friendly_error(e):
+    if isinstance(e, urllib.error.HTTPError):
+        return (f"The data source (football-data.co.uk) answered with an error ({e.code}). "
+                "That is usually brief. Please try again in a few minutes.")
+    if isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError)):
+        return "I couldn't reach the data source just now. Please try again in a few minutes."
+    return f"Something went wrong: {e}"
+
+
+async def send_long(update, text):
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
+async def run_acca(update, target, when=None):
+    target = 10.0 if target is None else target
+    note = ""
+    if target < MIN_TARGET:
+        note, target = f"The lowest target I use is {MIN_TARGET:g} odds.\n\n", MIN_TARGET
+    elif target > MAX_TARGET:
+        note, target = f"The highest target I use is {MAX_TARGET:g} odds.\n\n", MAX_TARGET
+    await update.message.reply_text("Working on it. The first request can take a minute...")
+    try:
+        cands, msg = await asyncio.to_thread(compute_candidates, when)
+        if cands is None:
+            await update.message.reply_text(msg)
+            return
+        acc = await asyncio.to_thread(build_accumulator, cands, target)
+        if _FX.get("stale"):
+            hours = max(0, int((time.time() - _FX["saved"]) / 3600))
+            note += (f"Note: football-data was unavailable, so I used fixtures saved about {hours} "
+                     "hour(s) ago.\n\n")
+        text = note + format_acca(acc)
+        use_api = af_enabled() and "legs" in acc
+        saved_note = "Saved to the prediction log. /stats shows how past picks did."
+        if not use_api:
+            if "legs" in acc:
+                try:
+                    if await asyncio.to_thread(log_acca, acc):
+                        text += "\n" + saved_note
+                        await asyncio.to_thread(push_db)
+                except Exception:
+                    logging.exception("could not write the log")
+            await send_long(update, text)
+            return
+
+        await send_long(update, text)
+        await update.message.reply_text(INCOMING_MSG)
+        final = acc
+        stop = threading.Event()
+
+        async def nudge():
+            await asyncio.sleep(AF_NUDGE)
+            await update.message.reply_text(NUDGE_MSG)
+
+        nudge_task = asyncio.create_task(nudge())
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(enrich_and_rebuild, cands, acc, target, stop), timeout=AF_HARD_TIMEOUT)
+        except asyncio.TimeoutError:
+            stop.set()
+            result = {"status": "slow"}
+        except Exception:
+            logging.exception("real-odds check failed")
+            result = {"status": "error"}
+        finally:
+            nudge_task.cancel()
+
+        if result["status"] == "ok":
+            final = result["acc"]
+            extra = [slip_diff(acc, final)]
+            if result["checked"] < result["total"]:
+                extra.append(f"Real odds found for {result['checked']} of {result['total']} matches checked; "
+                             "the rest keep their estimates.")
+            extra.append("Injury lists show who is out or doubtful, not how important they are. "
+                         "Check key players before betting.")
+            await send_long(update, format_acca(final, updated=True) + "\n\n" + "\n".join(extra))
+            if result.get("slow"):
+                await update.message.reply_text(SLOW_PARTIAL_MSG)
+        elif result["status"] == "slow":
+            await update.message.reply_text(SLOW_MSG)
+        elif result["status"] == "limit":
+            await update.message.reply_text("Real-odds checks are paused because today's request limit is "
+                                            "used up. The slip above stands.")
+        elif result["status"] == "down":
+            await update.message.reply_text("I couldn't reach the odds service just now, so the slip above "
+                                            "stands with its estimates. Try again in a few minutes.")
+        else:
+            await update.message.reply_text("I couldn't match these games on the odds service, so the slip "
+                                            "above stands with its estimates.")
+        try:
+            if await asyncio.to_thread(log_acca, final):
+                await update.message.reply_text(saved_note)
+                await asyncio.to_thread(push_db)
+        except Exception:
+            logging.exception("could not write the log")
+    except Exception as e:
+        logging.exception("acca failed")
+        await update.message.reply_text(friendly_error(e))
+
+
+async def run_predict(update, home, away):
+    await update.message.reply_text("Working on it. The first request can take a minute...")
+    try:
+        res = await asyncio.to_thread(make_prediction, home, away)
+        if res is None:
+            await update.message.reply_text(
+                "I couldn't find both teams in my leagues (see /leagues). Check the spelling.")
+            return
+        fx = await asyncio.to_thread(find_fixture, res)
+        if fx and fx.get("odds_hda"):
+            res = blend_with_market(res, fx["odds_hda"], fx.get("odds_ou"))
+        text = format_prediction(res)
+        if fx:
+            text += f"\n\nNext listed fixture: {fx['kickoff']}. Saved to the prediction log."
+            try:
+                await asyncio.to_thread(log_single, res, fx)
+                await asyncio.to_thread(push_db)
+            except Exception:
+                logging.exception("could not write the log")
+        else:
+            text += "\n\nNo upcoming fixture listed for this pairing, so it was not logged."
+        await update.message.reply_text(text)
+    except Exception as e:
+        logging.exception("predict failed")
+        await update.message.reply_text(friendly_error(e))
+
+
+async def leagues_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    names = [n for n, c in LEAGUE_CODES.items() if c not in ACCA_EXCLUDE]
+    text = "Leagues I cover:\n" + ", ".join(names)
+    if ACCA_EXCLUDE:
+        text += "\n\nLeft out of accumulators: " + ", ".join(CODE_TO_NAME.get(c, c) for c in sorted(ACCA_EXCLUDE))
+    await update.message.reply_text(text)
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, msg = await asyncio.to_thread(push_db)
+    await update.message.reply_text(("Backup OK. " if ok else "Backup failed. ") + msg)
+
+
+async def resetlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if " ".join(context.args).strip().lower() != "yes":
+        await update.message.reply_text("This deletes the whole prediction log. "
+                                        "To go ahead, send: /resetlog yes")
+        return
+    n = await asyncio.to_thread(reset_log)
+    await asyncio.to_thread(push_db)
+    await update.message.reply_text(f"Prediction log cleared ({n} rows removed).")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Checking for new results...")
+    try:
+        if await asyncio.to_thread(settle_pending):
+            await asyncio.to_thread(push_db)
+        await send_long(update, await asyncio.to_thread(stats_text))
+    except Exception as e:
+        logging.exception("stats failed")
+        await update.message.reply_text(friendly_error(e))
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP)
+
+
+async def acca_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = " ".join(context.args)
+    await run_acca(update, parse_target(args), parse_when(args))
+
+
+async def predict_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = parse_match(" ".join(context.args))
+    if not match:
+        await update.message.reply_text("Format like: /predict Arsenal vs Chelsea")
+        return
+    await run_predict(update, *match)
+
+
+async def run_slip_review(update, legs):
+    if not legs:
+        await update.message.reply_text("I couldn't read any legs from that. Try a clearer screenshot, "
+                                        "or paste the slip as text after /slip.")
+        return
+    await update.message.reply_text("Reviewing your slip. The first request can take a minute...")
+    try:
+        rows = await asyncio.to_thread(analyze_slip, legs)
+        text = format_slip_review(rows)
+        acc = slip_to_acca(rows)
+        if acc:
+            try:
+                if await asyncio.to_thread(log_acca, acc, "review"):
+                    text += "\nSaved to the prediction log (upcoming matches only)."
+                    await asyncio.to_thread(push_db)
+            except Exception:
+                logging.exception("could not write the log")
+        await send_long(update, text)
+    except Exception as e:
+        logging.exception("slip review failed")
+        await update.message.reply_text(friendly_error(e))
+
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.photo:
+        return
+    await msg.reply_text("Reading your slip...")
+    try:
+        f = await msg.photo[-1].get_file()
+        data = bytes(await f.download_as_bytearray())
+        legs = await parse_slip(image_bytes=data, text=msg.caption)
+    except Exception as e:
+        logging.exception("could not read the slip")
+        await msg.reply_text(f"I couldn't read that slip right now ({type(e).__name__}). Try again in a minute.")
+        return
+    await run_slip_review(update, legs)
+
+
+async def slip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = re.sub(r"^/slip(@\w+)?\s*", "", update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Send a screenshot of your slip, or paste it like this:\n"
+                                        "/slip\nEibar vs Cadiz - Home @1.28\nEldense vs Sabadell - Over 1.5 @1.53")
+        return
+    try:
+        legs = await parse_slip(text=text)
+    except Exception as e:
+        await update.message.reply_text(f"I couldn't read that right now ({type(e).__name__}). Try again in a minute.")
+        return
+    await run_slip_review(update, legs)
+
+
+def looks_like_slip(text):
+    return len(re.findall(r"\b(?:vs\.?|v)\b", text, flags=re.I)) >= 2
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    if looks_like_slip(update.message.text):
+        try:
+            legs = await parse_slip(text=update.message.text)
+        except Exception as e:
+            await update.message.reply_text(f"I couldn't read that right now ({type(e).__name__}). Try again in a minute.")
+            return
+        await run_slip_review(update, legs)
+        return
+    info = await understand(update.message.text)
+    intent = info.get("intent")
+    if intent == "acca":
+        await run_acca(update, info.get("target"), parse_when(update.message.text))
+    elif intent == "predict" and info.get("home") and info.get("away"):
+        await run_predict(update, info["home"], info["away"])
+    else:
+        await update.message.reply_text(HELP)
+
+
+if __name__ == "__main__":
+    if "PASTE" in TELEGRAM_TOKEN or "PASTE" in GEMINI_API_KEY:
+        raise SystemExit("Put your NEW Telegram token and Gemini key at the top of the file first.")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    restore_db()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler(["start", "help"], start_cmd))
+    app.add_handler(CommandHandler("acca", acca_cmd))
+    app.add_handler(CommandHandler("predict", predict_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("leagues", leagues_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("resetlog", resetlog_cmd))
+    app.add_handler(CommandHandler("slip", slip_cmd))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
+    threading.Thread(target=lambda: prefetch(list(LEAGUE_CODES.values())), daemon=True).start()
+
+    base_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if base_url:   # hosted: Telegram calls us, so a sleeping free host wakes up on your message
+        import hashlib
+        path = hashlib.sha256(("path:" + TELEGRAM_TOKEN).encode()).hexdigest()[:40]
+        secret = hashlib.sha256(("header:" + TELEGRAM_TOKEN).encode()).hexdigest()[:40]
+        print("Bot starting in webhook mode.")
+        app.run_webhook(listen="0.0.0.0", port=int(os.environ.get("PORT", "10000")),
+                        url_path=path, webhook_url=f"{base_url.rstrip('/')}/{path}",
+                        secret_token=secret)
+    else:          # on your phone or a computer
+        print("Bot is running (loading league data in the background). Press stop to quit.")
+        app.run_polling()
